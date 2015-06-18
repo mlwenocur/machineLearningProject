@@ -1,0 +1,3 @@
+Creation of a classifier to type the performing of a weight lifting maneuver, base on data graciously shared by the authors of Wearable Computing: Accelerometers' Data Classification of Body Postures and Movements Ugulino, W.; Cardador, D.; Vega, K.; Velloso, E.; Milidiu, R.; Fuks, H. Wearable Computing: Accelerometers' Data Classification of Body Postures and Movements
+
+Our approach is distinctive in that we pool a group of random forests each trained on truly statistically independent data. We pool by taking a positively weighted combination of the individual probabilities and then choose the class with largest value.

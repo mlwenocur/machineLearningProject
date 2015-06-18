@@ -1,0 +1,203 @@
+---
+title: "Analysis of Automated System for Detecting Bad Form"
+author: "Michael Wenocur"
+date: "Tuesday, June 16, 2015"
+output: html_document
+---
+### Summary of Challenges and Measured Results
+The physical meaning of the source table is briefly described in
+http://groupware.les.inf.puc-rio.br/har .
+
+The training data is very sequential in nature making it very hard to obtain statistically independent testing and training partitions. Intrinsically there must be points in the sequence where one repetition has been completed and the next one has yet to begin. If the data could be segmented and marked accordingly then it would greatly facilitate the choosing of independent partitions by keeping full segments in each partition.
+
+Overall, this has much in common with the segmentation of cursive handwriting into individual letters.
+
+I believe that the authors of the study will obtain greater success when they incorporate the sequentiality of the data into their model. To do otherwise is akin to trying to recognize a movie based on a few consecutive video frames at best, a much more difficult prospect.
+
+To mitigate the high degree of statistical dependence, I have taken the approach of generating a grove of random trees each trained solely on one participant's data. For example there is a _charles_ forest trained on on a subset of _charles_ data. 
+
+I generate a prediction from my grove by summing together the probabilities of all the different models and then choosing the _classe_ with the maximum probability. For reasons, not understood the probabilities for the _E_ class tend to be overstated. By tuning on the training set only, I selected a scaling factor for _E_ of 0.5 which empirically seems to give the best results,
+
+Each individual model performed quite poorly on the combined training data (under 70% overall accuracy) but pooling them together makes for a much more satisfactory predictor. Of course, interpretability becomes a very great challenge.
+
+It is relevant to note that each random forest in the grove is statistically independent of other grove members, but not likely independent of some of the test data, due to the close temporal proximity of samples in the training set to samples in the test set. 
+
+Consequently, I take the 0.90 accuracy measured on the test set as an upper bound on true out-of-sample accuracy.
+
+On practical note I observed that training randomForests were very much faster than trying to train boosted trees.
+
+### Data Tidying Considerations
+I removed 100 parameters which are undefined for all twenty rows of
+pml-testing.csv, the project test file. I removed all bookkeeping parameters except for user\_name and _classe_. User\_name is removed from data frame prior to using the frame for training forests or getting predictions. 
+
+By removing the user name data it enables the training of models that are user independent. Though one could imagine that an application beginning with a generic model and slowly morphing it to conform with an individual user.
+
+#### Load and tidy the data
+
+```{r loadTable}
+require(dplyr,quietly = TRUE, warn.conflicts = FALSE)
+ptrain <- read.csv('pml-training.csv')
+TidyData <- function(rawdata) {
+    # Collect all the columns defined for each time reading into a sub table
+    subset <- rawdata
+    for (j in names(subset)) {
+        if (mean(is.na(subset[[j]])) > 0.975) subset[[j]] <- NULL
+        else if (mean(as.character(subset[[j]]) =='') > 0.975){
+            subset[[j]] <-  NULL
+        }
+    }
+    subset$X <- NULL
+    subset$raw_timestamp_part_1 <- NULL
+    subset$cvtd_timestamp <- NULL
+    subset$new_window <- NULL
+    subset$num_window <- NULL
+    subset$raw_timestamp_part_2 <- NULL
+    
+    if ('classe' %in% names(subset)){
+        x <- select(subset, classe)
+        subset$classe <- NULL
+        subset <- cbind(x, subset)
+        
+    }
+    
+    return(subset)
+}
+cleanData <- TidyData(ptrain)
+```
+
+#### Code for generating a grove of random forests
+```{r genForest}
+require(caret, quietly = TRUE, warn.conflicts = FALSE)
+require(randomForest, quietly = TRUE, warn.conflicts = FALSE)
+
+GetRandForest <- function(trset, ntrees = 500, uname) {
+    trset <- trset[trset$user_name == uname,]
+    trset$user_name <- NULL
+    set.seed(7982)
+    rfFit <- randomForest(classe ~., data = trset, 
+                          ntree = ntrees, importance = TRUE)
+}
+```
+When we train the grove of forests we put aside 1 - trPct of the training samples for final testing. Since each forest is only trained on approximately 1/6 of the training data, the training set
+as a whole makes a fair cross validation set for the
+group of forests as whole, because the other 5/6 is statistically
+independent of the training data used to train the forest. 
+
+More concretely, we train a forest based only on the data for a given participant which is 1/6 of the training data. The rest of the data was measured on some other participant.
+```{r genGrove}
+GetRandomGrove <- function(dataset, trPct = 0.85, ntrees = 200){
+
+    
+    set.seed(825)
+    selIndices <- createDataPartition(dataset$classe,
+                                      p = trPct, list = FALSE)
+    trset <- dataset[selIndices,]
+    nlist <- as.character(unique(trset$user_name))
+    predictors <- lapply(nlist, function(uname){
+        GetRandForest(trset,  ntrees, uname)
+    })
+    names(predictors) <- nlist
+    return(predictors)
+}
+forestGrove <- GetRandomGrove(cleanData)
+```
+
+#### Code for computing classifications using a grove of random trees
+```{r measureResults}
+GetClassifications <- function(ctrain, models, trPct = 0.85, 
+                          useTestSet = TRUE, trset = NULL){
+    nlist <- as.character(unique(ctrain$user_name))
+    if (is.null(trset) == TRUE)
+    {
+        set.seed(825)
+        choice <- createDataPartition(ctrain$classe, p = trPct,
+                                      list = FALSE)
+        if (useTestSet){
+            trset <- ctrain[-choice,]
+        }
+        else {
+            trset <- ctrain[choice,]
+        }
+    }
+    trset$user_name <- NULL
+    preds <- lapply(nlist, function(j){ 
+        predictions <- predict(models[[j]], trset, 
+                               type = 'prob')
+    })
+    names(preds) <- nlist
+    dims = dim(preds[[1]])
+
+    # Create matsum as a zero matrix used to compute
+    # the sum of prediction probabilities across the six models
+    nr <- dims[1]; nc <- dims[2]
+    matsum <- matrix(data = rep(0, nr * nc), nrow = nr, ncol = nc)
+    for (j in nlist) matsum <- matsum + preds[[j]]
+    preds <- data.frame(matsum)
+    # Rescale the E column using an empirically derived factor
+    # because otherwise it would be overweighted
+    preds <- mutate(preds, E = E * 0.5)
+    # Determine the label of the maximum value for each prediction row.
+    v <- sapply(1:dim(preds)[1], function(j){
+        names(which.max(preds[j,]))})
+    return (v)
+}
+```
+
+#### Code for outputting classification results and submission files
+```{r outputRoutines}
+OutputConfusionTables <- function(groves, ctrain, 
+                                  useTestData = TRUE){
+    classifications <- GetClassifications(ctrain, groves, 
+                             useTestSet = useTestData)
+    set.seed(825)
+    choice <- createDataPartition(ctrain$classe, p = 0.85, 
+                                  list = FALSE)
+    if (useTestData)
+    {
+        tdata <- ctrain$classe[-choice]
+        outPhrase <- 'Accuracy on testing data'
+    }
+    else
+    {
+        tdata <-ctrain$classe[choice]
+        outPhrase <- 'Accuracy on training data'
+    }
+   
+    print(table(classifications, tdata))
+    
+    print(paste(outPhrase, round(mean(classifications == tdata), 3)))
+ 
+
+}
+print('Output in-sample test results')
+OutputConfusionTables(forestGrove, cleanData, FALSE)
+print('Output out-of-sample test results')
+OutputConfusionTables(forestGrove, cleanData, TRUE)
+```
+
+##### Project submission file routines
+```{r outputResults}
+pml_write_files = function(x){
+    n = length(x)
+    for(i in 1:n){
+        filename = paste0("problem_id_",i,".txt")
+        write.table(x[i],file=filename,quote=FALSE,
+                    row.names=FALSE,col.names=FALSE)
+    }
+}
+
+
+OutputTestAnswers <- function(models, directory){
+    rawTestData = read.csv('pml-testing.csv')
+    tset <- TidyData(rawTestData)
+    setwd(directory)
+    classifications <- GetClassifications(tset, models, trset = tset)
+    pml_write_files(as.character(classifications))
+    setwd('..')
+}
+
+print('Output test files')
+OutputTestAnswers(forestGrove,'submissions')
+
+```
+
